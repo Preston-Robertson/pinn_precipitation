@@ -33,27 +33,28 @@ log = logging.getLogger(__name__)
 
 # ── Training step ─────────────────────────────────────────────────────────────
 
-def train_step(model, batch, criterion, optimizer, device):
+def train_step(model, batch, criterion, optimizer, device, sigma_P):
     model.train()
     optimizer.zero_grad()
 
-    coords = batch["coords"].to(device)          # (B, 3)
-    atm    = batch["atm"].to(device)             # (B, 4)
-    P_true = batch["P"].to(device)               # (B, 1)
-    dq_dt  = batch["dq_dt"].to(device)           # (B, 1)
-    dq_dx  = batch["dq_dx"].to(device)           # (B, 1)
-    dq_dy  = batch["dq_dy"].to(device)           # (B, 1)
+    coords  = batch["coords"].to(device)         # (B, 3) normalised
+    atm     = batch["atm"].to(device)            # (B, 4) normalised network input
+    atm_raw = batch["atm_raw"].to(device)        # (B, 4) raw [q,u,v,E]
+    P_true  = batch["P_raw"].to(device)          # (B, 1) raw target
+    dq_dt   = batch["dq_dt"].to(device)          # (B, 1) raw
+    dq_dx   = batch["dq_dx"].to(device)          # (B, 1) raw
+    dq_dy   = batch["dq_dy"].to(device)          # (B, 1) raw
 
-    # Atmospheric variables for physics residual
-    q = atm[:, 0:1]
-    u = atm[:, 1:2]
-    v = atm[:, 2:3]
-    E = atm[:, 3:4]
+    # Raw atmospheric fields for the physics residual
+    q = atm_raw[:, 0:1]
+    u = atm_raw[:, 1:2]
+    v = atm_raw[:, 2:3]
+    E = atm_raw[:, 3:4]
 
-    # Forward pass
-    P_pred = model(coords, atm)                  # (B, 1)
+    # Forward pass (model outputs raw P via Softplus, >= 0)
+    P_pred = model(coords, atm)                  # (B, 1) raw
 
-    # Physics residual using pre-computed finite-difference derivatives
+    # Physics residual in raw units (mm-equivalent per timestep)
     residual = water_vapor_residual(
         P=P_pred, q=q, u=u, v=v, E=E,
         coords=coords,
@@ -62,7 +63,10 @@ def train_step(model, batch, criterion, optimizer, device):
         dq_dy_fd=dq_dy,
     )
 
-    losses = criterion(P_pred, P_true, residual)
+    # Scale by sigma_P so MSEs are dimensionless and O(1) -- this is
+    # equivalent to z-scoring P_pred/P_true while keeping the residual on
+    # the same footing as the data term.
+    losses = criterion(P_pred / sigma_P, P_true / sigma_P, residual / sigma_P)
     losses["total"].backward()
 
     # Gradient clipping — important for PINNs (autograd can spike)
@@ -73,20 +77,21 @@ def train_step(model, batch, criterion, optimizer, device):
 
 
 @torch.no_grad()
-def val_step(model, batch, criterion, device):
+def val_step(model, batch, criterion, device, sigma_P):
     model.eval()
 
-    coords = batch["coords"].to(device)
-    atm    = batch["atm"].to(device)
-    P_true = batch["P"].to(device)
-    dq_dt  = batch["dq_dt"].to(device)
-    dq_dx  = batch["dq_dx"].to(device)
-    dq_dy  = batch["dq_dy"].to(device)
+    coords  = batch["coords"].to(device)
+    atm     = batch["atm"].to(device)
+    atm_raw = batch["atm_raw"].to(device)
+    P_true  = batch["P_raw"].to(device)
+    dq_dt   = batch["dq_dt"].to(device)
+    dq_dx   = batch["dq_dx"].to(device)
+    dq_dy   = batch["dq_dy"].to(device)
 
-    q = atm[:, 0:1]
-    u = atm[:, 1:2]
-    v = atm[:, 2:3]
-    E = atm[:, 3:4]
+    q = atm_raw[:, 0:1]
+    u = atm_raw[:, 1:2]
+    v = atm_raw[:, 2:3]
+    E = atm_raw[:, 3:4]
 
     P_pred = model(coords, atm)
     residual = water_vapor_residual(
@@ -97,7 +102,7 @@ def val_step(model, batch, criterion, device):
         dq_dy_fd=dq_dy,
     )
 
-    losses = criterion(P_pred, P_true, residual)
+    losses = criterion(P_pred / sigma_P, P_true / sigma_P, residual / sigma_P)
     return {k: v.item() for k, v in losses.items()}
 
 
@@ -126,8 +131,10 @@ def train(
     train_loader, val_loader, normalizer = make_dataloader(
         data_path, batch_size=batch_size
     )
+    Path(checkpoint_dir).mkdir(parents=True, exist_ok=True)
     normalizer.save(f"{checkpoint_dir}/normalizer.json")
-    log.info(f"Train batches: {len(train_loader)} | Val batches: {len(val_loader)}")
+    sigma_P = float(normalizer.stats["P"]["std"])    # for loss scaling
+    log.info(f"Train batches: {len(train_loader)} | Val batches: {len(val_loader)} | sigma_P={sigma_P:.4g}")
 
     # ── Model ─────────────────────────────────────────────────────────────
     model = PrecipitationPINN(
@@ -172,7 +179,7 @@ def train(
         # Train
         train_losses = {"total": 0.0, "data": 0.0, "physics": 0.0}
         for batch in train_loader:
-            step_losses = train_step(model, batch, criterion, optimizer, device)
+            step_losses = train_step(model, batch, criterion, optimizer, device, sigma_P)
             for k in train_losses:
                 train_losses[k] += step_losses[k]
         for k in train_losses:
@@ -181,7 +188,7 @@ def train(
         # Validate
         val_losses = {"total": 0.0, "data": 0.0, "physics": 0.0}
         for batch in val_loader:
-            step_losses = val_step(model, batch, criterion, device)
+            step_losses = val_step(model, batch, criterion, device, sigma_P)
             for k in val_losses:
                 val_losses[k] += step_losses[k]
         for k in val_losses:

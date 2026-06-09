@@ -58,15 +58,15 @@ def generate_synthetic_era5(
     v = 2.0 * np.sin(lat_rad) * np.cos(2 * np.pi * T / n_times)
 
     # ── Humidity field ────────────────────────────────────────────────────
-    # q ~ Gaussian moisture blob that advects with wind
-    q = 0.01 * (
-        np.exp(-((LAT - 45) ** 2) / 200 - ((LON - 15) ** 2) / 400)
-        + 0.3 * rng.standard_normal((n_times, n_lats, n_lons))
+    # q ~ Gaussian moisture blob; tiny noise so FD derivatives stay meaningful
+    q = (
+        0.01 * np.exp(-((LAT - 45) ** 2) / 200 - ((LON - 15) ** 2) / 400)
+        + 1e-6 * rng.standard_normal((n_times, n_lats, n_lons))
     )
     q = np.clip(q, 0, None)
 
     # ── Evaporation (always positive) ────────────────────────────────────
-    E = 0.0005 * (0.5 + np.sin(lat_rad)) + 0.0001 * rng.standard_normal(q.shape)
+    E = 0.0005 * (0.5 + np.sin(lat_rad)) + 1e-7 * rng.standard_normal(q.shape)
     E = np.clip(E, 0, None)
 
     # ── Precipitation from continuity: P = E - ∂q/∂t - u·∂q/∂x - v·∂q/∂y
@@ -74,8 +74,15 @@ def generate_synthetic_era5(
     dq_dy = np.gradient(q, axis=1)
     dq_dx = np.gradient(q, axis=2)
 
-    P = E - dq_dt - u * dq_dx - v * dq_dy
-    P = np.clip(P, 0, None)   # precipitation can't be negative
+    # Advection + tendency term A: P = E - A
+    A = dq_dt + u * dq_dx + v * dq_dy
+
+    # Lift E so that E >= A everywhere → P >= 0 by construction, no clip needed.
+    # This keeps the residual (E - P - A) exactly zero on the synthetic data.
+    shift = max(0.0, float(A.max()) + 1e-7)
+    E = E + shift
+
+    P = E - A
     P = P / 1000.0            # convert to metres to match ERA5 convention
 
     E_m = E / 1000.0

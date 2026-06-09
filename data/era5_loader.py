@@ -133,13 +133,16 @@ class ERA5Dataset(Dataset):
     """
     Loads ERA5 NetCDF data and exposes flattened (point, time) samples.
 
-    Each sample is:
-        coords: [lon_norm, lat_norm, t_norm]       shape (3,)
-        atm:    [q_norm, u_norm, v_norm, E_norm]   shape (4,)
-        P:      [P_norm]                           shape (1,)
+    Network inputs are z-scored for stable optimisation:
+        coords:  [lon_norm, lat_norm, t_norm]       shape (3,)
+        atm:     [q_norm, u_norm, v_norm, E_norm]   shape (4,)
 
-    Finite-difference humidity derivatives (dq/dt, dq/dx, dq/dy) are also
-    pre-computed and returned for efficient physics loss evaluation.
+    Targets and physics-side fields stay in **raw physical units** so the
+    continuity-equation residual is dimensionally consistent. The model's
+    Softplus head also produces P in raw units (>= 0).
+        P_raw:   [P]                                shape (1,)
+        atm_raw: [q, u, v, E]                       shape (4,)
+        dq_dt, dq_dx, dq_dy: finite-difference derivatives of raw q
     """
 
     def __init__(self, nc_path: str, normalizer: Optional[ERA5Normalizer] = None):
@@ -150,7 +153,7 @@ class ERA5Dataset(Dataset):
 
         ds = xr.open_dataset(nc_path)
 
-        # ── Extract arrays (T, lat, lon) ──────────────────────────────────
+        # ── Extract arrays (T, lat, lon) in raw physical units ────────────
         P_raw = ds["tp"].values * 1000.0      # m → mm  (hourly accumulation)
         q_raw = ds["q"].values
         u_raw = ds["u10"].values
@@ -161,30 +164,29 @@ class ERA5Dataset(Dataset):
         lons = ds["longitude"].values
         times = np.arange(P_raw.shape[0], dtype=np.float32)
 
-        # ── Normalise ─────────────────────────────────────────────────────
+        # ── Normaliser (network-input scaling only; targets stay raw) ─────
         if normalizer is None:
             normalizer = ERA5Normalizer()
             normalizer.fit({"P": P_raw, "q": q_raw, "u": u_raw, "v": v_raw, "E": E_raw})
         self.normalizer = normalizer
 
-        P = normalizer.transform("P", P_raw)
-        q = normalizer.transform("q", q_raw)
-        u = normalizer.transform("u", u_raw)
-        v = normalizer.transform("v", v_raw)
-        E = normalizer.transform("E", E_raw)
+        q_n = normalizer.transform("q", q_raw)
+        u_n = normalizer.transform("u", u_raw)
+        v_n = normalizer.transform("v", v_raw)
+        E_n = normalizer.transform("E", E_raw)
 
-        # Normalise coordinates to [-1, 1]
+        # Normalise coordinates to ~[-1, 1]
         lon_n = (lons - lons.mean()) / (lons.std() + 1e-8)
         lat_n = (lats - lats.mean()) / (lats.std() + 1e-8)
         t_n   = (times - times.mean()) / (times.std() + 1e-8)
 
-        # ── Finite-difference humidity gradients ──────────────────────────
-        dq_dt = np.gradient(q, axis=0)   # ∂q/∂t
-        dq_dy = np.gradient(q, axis=1)   # ∂q/∂lat  (y direction)
-        dq_dx = np.gradient(q, axis=2)   # ∂q/∂lon  (x direction)
+        # FD derivatives on RAW q so the residual is in physical units
+        dq_dt = np.gradient(q_raw, axis=0)   # ∂q/∂t
+        dq_dy = np.gradient(q_raw, axis=1)   # ∂q/∂lat  (y direction)
+        dq_dx = np.gradient(q_raw, axis=2)   # ∂q/∂lon  (x direction)
 
         # ── Flatten to (N_samples, ...) ───────────────────────────────────
-        T, H, W = P.shape
+        T, H, W = P_raw.shape
         LON, LAT = np.meshgrid(lon_n, lat_n)  # (H, W) each
 
         # Broadcast coords across time
@@ -195,16 +197,27 @@ class ERA5Dataset(Dataset):
         self.coords = torch.tensor(
             np.stack([LON_T, LAT_T, TIM_T], axis=-1), dtype=torch.float32
         )
+        # Normalised atmospheric inputs (network)
         self.atm = torch.tensor(
             np.stack([
-                q.reshape(-1),
-                u.reshape(-1),
-                v.reshape(-1),
-                E.reshape(-1),
+                q_n.reshape(-1),
+                u_n.reshape(-1),
+                v_n.reshape(-1),
+                E_n.reshape(-1),
             ], axis=-1),
             dtype=torch.float32,
         )
-        self.P = torch.tensor(P.reshape(-1, 1), dtype=torch.float32)
+        # Raw atmospheric fields (physics residual)
+        self.atm_raw = torch.tensor(
+            np.stack([
+                q_raw.reshape(-1),
+                u_raw.reshape(-1),
+                v_raw.reshape(-1),
+                E_raw.reshape(-1),
+            ], axis=-1),
+            dtype=torch.float32,
+        )
+        self.P_raw = torch.tensor(P_raw.reshape(-1, 1), dtype=torch.float32)
         self.dq_dt = torch.tensor(dq_dt.reshape(-1, 1), dtype=torch.float32)
         self.dq_dx = torch.tensor(dq_dx.reshape(-1, 1), dtype=torch.float32)
         self.dq_dy = torch.tensor(dq_dy.reshape(-1, 1), dtype=torch.float32)
@@ -212,16 +225,17 @@ class ERA5Dataset(Dataset):
         log.info(f"ERA5Dataset: {len(self)} samples loaded from {nc_path}")
 
     def __len__(self) -> int:
-        return len(self.P)
+        return len(self.P_raw)
 
     def __getitem__(self, idx) -> dict:
         return {
-            "coords": self.coords[idx],   # (3,)
-            "atm":    self.atm[idx],      # (4,)
-            "P":      self.P[idx],        # (1,)
-            "dq_dt":  self.dq_dt[idx],    # (1,)
-            "dq_dx":  self.dq_dx[idx],    # (1,)
-            "dq_dy":  self.dq_dy[idx],    # (1,)
+            "coords":  self.coords[idx],    # (3,)  normalised
+            "atm":     self.atm[idx],       # (4,)  normalised
+            "atm_raw": self.atm_raw[idx],   # (4,)  raw [q,u,v,E]
+            "P_raw":   self.P_raw[idx],     # (1,)  raw target
+            "dq_dt":   self.dq_dt[idx],     # (1,)  raw
+            "dq_dx":   self.dq_dx[idx],     # (1,)  raw
+            "dq_dy":   self.dq_dy[idx],     # (1,)  raw
         }
 
 

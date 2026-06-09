@@ -98,37 +98,37 @@ def evaluate_checkpoint(
     model = load_checkpoint(checkpoint_path, device=device)
     dataset = ERA5Dataset(nc_path, normalizer=normalizer)
 
+    # Model outputs raw P (Softplus head). Dataset targets/atm are already raw.
     P_pred = predict(model, dataset.coords, dataset.atm, device=device)
+    P_true = dataset.P_raw.numpy().squeeze()
 
-    # De-normalise
-    P_true_norm = dataset.P.numpy().squeeze()
-    P_true_phys = normalizer.inverse_transform_precip(P_true_norm) if normalizer else P_true_norm
-    P_pred_phys = normalizer.inverse_transform_precip(P_pred) if normalizer else P_pred
+    metrics = compute_metrics(P_true, P_pred)
 
-    metrics = compute_metrics(P_true_phys, P_pred_phys)
-
-    # Physics residual on a sample
+    # Physics residual on a sample (raw units, then normalised by sigma_P)
     sample_size = min(10_000, len(dataset))
     idx = np.random.choice(len(dataset), sample_size, replace=False)
-    coords_s = dataset.coords[idx]
-    atm_s    = dataset.atm[idx]
-    P_pred_t = torch.tensor(P_pred[idx, None])
-    dq_dt_s  = dataset.dq_dt[idx]
-    dq_dx_s  = dataset.dq_dx[idx]
-    dq_dy_s  = dataset.dq_dy[idx]
+    coords_s  = dataset.coords[idx]
+    atm_raw_s = dataset.atm_raw[idx]
+    P_pred_t  = torch.tensor(P_pred[idx, None])
+    dq_dt_s   = dataset.dq_dt[idx]
+    dq_dx_s   = dataset.dq_dx[idx]
+    dq_dy_s   = dataset.dq_dy[idx]
 
     residual = water_vapor_residual(
         P=P_pred_t,
-        q=atm_s[:, 0:1],
-        u=atm_s[:, 1:2],
-        v=atm_s[:, 2:3],
-        E=atm_s[:, 3:4],
+        q=atm_raw_s[:, 0:1],
+        u=atm_raw_s[:, 1:2],
+        v=atm_raw_s[:, 2:3],
+        E=atm_raw_s[:, 3:4],
         coords=coords_s,
         dq_dt_fd=dq_dt_s,
         dq_dx_fd=dq_dx_s,
         dq_dy_fd=dq_dy_s,
     )
     metrics["PhysicsResidualRMSE"] = float(residual.pow(2).mean().sqrt())
+    if dataset.normalizer is not None:
+        sigma_P = float(dataset.normalizer.stats["P"]["std"])
+        metrics["PhysicsResidualRMSE_norm"] = metrics["PhysicsResidualRMSE"] / sigma_P
 
     log.info("Evaluation results:")
     for k, v in metrics.items():
